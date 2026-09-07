@@ -1,0 +1,4 @@
+tests/.keys/*.json
+__pycache__/
+artifacts/
+.pytest_cache/
