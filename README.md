@@ -11,7 +11,9 @@ lines, 20 public methods (11 write, 9 view), 0 constructor parameters.
 
 ## Table of contents
 
+- [Overview](#overview)
 - [The problem](#the-problem)
+- [How it works: a worked example](#how-it-works-a-worked-example)
 - [Design boundary: what's deterministic vs. what needs consensus](#design-boundary-whats-deterministic-vs-what-needs-consensus)
 - [Why this shouldn't produce an UNDETERMINED consensus result](#why-this-shouldnt-produce-an-undetermined-consensus-result)
 - [The consensus-verified write paths](#the-consensus-verified-write-paths)
@@ -20,8 +22,67 @@ lines, 20 public methods (11 write, 9 view), 0 constructor parameters.
 - [Full method reference](#full-method-reference)
 - [Repository layout](#repository-layout)
 - [Why this is a reusable primitive, not a one-off demo](#why-this-is-a-reusable-primitive-not-a-one-off-demo)
+- [Design decisions and trade-offs](#design-decisions-and-trade-offs)
 - [Reading order for reviewers](#reading-order-for-reviewers)
 - [Verified](#verified)
+
+## Overview
+
+Promise Ledger is a GenLayer Intelligent Contract that gives an
+autonomous service, agent, or resource provider a way to **register a
+fixed, finite capacity model once**, and then have every subsequent
+natural-language commitment against that capacity pass through a single
+gate before it is allowed to stand as an accepted promise. The gate
+either **admits** the commitment (optionally reserving capacity against
+it), **rejects** it outright (deterministically, if it would
+overcommit), or **escalates** it to a human/owner decision (if the
+obligation's meaning is genuinely too vague to classify safely).
+
+The core idea is a strict separation of concerns between two kinds of
+work, enforced in code rather than left to convention:
+
+- **Capacity accounting is 100% deterministic.** Total units, how many
+  are currently reserved, whether a new request's time window overlaps
+  an existing reservation, and whether a request fits — all of this is
+  plain Python integer arithmetic. No LLM output ever reaches this code
+  path, so the overcommitment guarantee holds regardless of what any
+  model says.
+- **Only the semantic *mapping* step uses GenLayer consensus.** When a
+  provider or their counterparty writes an obligation in plain English
+  ("a dedicated responder is reserved exclusively for you"), something
+  has to decide (a) whether that sentence is actually talking about the
+  capacity category the provider registered, and (b) whether honoring
+  it would draw down that capacity. That decision requires
+  interpreting natural language, so it's the one place this contract
+  asks a validator-run LLM a question — and even then, the model is
+  only ever allowed to answer a **closed three-way question**, never to
+  set a number or decide whether a conflict is acceptable.
+
+On top of that split, the contract adds a full **escrow layer**: every
+commitment submission locks a GEN bond, and every one of the six
+possible outcomes for that bond (admitted, rejected for capacity,
+rejected for bad faith, cancelled, timed out, or released) is an
+explicit, independently reachable code path that zeroes the stored
+ledger amount before ever calling the single GEN-transfer function —
+so a bond can never be paid out twice, and never gets stuck with no
+way out. The contract also integrates **real web fetches** (to pull in
+external corroborating evidence like an SLA or status page) and **real
+image/vision analysis** (to accept a photograph as supporting evidence
+for a capacity claim), both wired through GenLayer's consensus
+primitives with the same "bounded question, comparative validator"
+discipline as the core classifier — and both are structurally
+prevented from ever mutating a capacity number or triggering a payout,
+so they can only ever add corroborating context, never override the
+deterministic guarantee.
+
+Every one of these pieces — the capacity math, the bounded classifier,
+all six escrow exit paths, the web fetch, and the image evidence — has
+been exercised against a real, live StudioNet deployment with real GEN,
+real accounts, a real fetched photograph, a real external URL, and real
+LLM consensus rounds. See [Verified](#verified) and
+[`docs/TESTING.md`](docs/TESTING.md) for the full report, including a
+storage bug the live testing process caught and fixed before this
+README was written.
 
 ## The problem
 
@@ -43,6 +104,103 @@ Promise Ledger gives a provider a way to register that hard number once,
 and then forces every subsequent natural-language commitment through a
 gate that can admit, reject, or escalate it — before it is allowed to
 stand as an accepted promise.
+
+## How it works: a worked example
+
+This walkthrough uses the exact scenario exercised by the live test
+suite (see [`docs/TESTING.md`](docs/TESTING.md)) — a GPU inference
+fleet with four physical units — to show the full call sequence from an
+empty contract to an admitted commitment and a correctly rejected
+overcommitment.
+
+**1. The provider registers their capacity, once.**
+
+```python
+register_pool(
+    pool_id="gpu-fleet-useast1",
+    name="Real-Time GPU Inference Fleet (us-east-1)",
+    unit_label="gpu_units",
+    total_units="4",
+    registration_stake_wei="50000000000000000",   # 0.05 GEN, paid with the call
+    bond_wei_per_commitment="10000000000000000",  # 0.01 GEN per future commitment
+    description="Four dedicated H100 GPU units ...",
+)
+```
+
+This is a plain deterministic write. `total_units` is now fixed at 4 and
+can only ever be raised freely or lowered down to the level of whatever
+is currently reserved (`update_capacity`) — never below it, so a
+provider can't retroactively manufacture an overcommitment by shrinking
+the pool out from under existing reservations.
+
+**2. A counterparty submits a natural-language obligation against it.**
+
+```python
+submit_commitment(
+    commitment_id="acme-fraud-detection-001",
+    pool_id="gpu-fleet-useast1",
+    obligation_text="Acme Corp is guaranteed exclusive access to 2 dedicated "
+                     "GPU units in the us-east-1 inference fleet for our "
+                     "real-time fraud-detection workload, for the full "
+                     "duration of the reserved window.",
+    requested_units="2",
+    window_start_epoch="0",   # 0 = unbounded start
+    window_end_epoch="0",     # 0 = unbounded end
+)
+# paid with exactly bond_wei_per_commitment (0.01 GEN)
+```
+
+The bond is now escrowed. `requested_units=2` is a plain integer the
+caller asserts — the contract does not yet know if this obligation
+really belongs to the `gpu-fleet-useast1` category or if honoring it
+would consume capacity from it. That's resolved next.
+
+**3. Classification runs under GenLayer consensus.**
+
+```python
+classify_commitment(commitment_id="acme-fraud-detection-001")
+```
+
+Internally, a validator-run LLM is given only the pool's name, unit
+label, and total capacity, plus the obligation text, and asked to
+answer two bounded questions: does this really belong to the
+`gpu-fleet-useast1` category, and does fulfilling it consume capacity
+from it (`CONSUMES` / `DOES_NOT_CONSUME` / `AMBIGUOUS`)? Every validator
+independently reruns the same question and the result only stands if
+leader and validator agree on both fields — see
+[Why this shouldn't produce an UNDETERMINED consensus result](#why-this-shouldnt-produce-an-undetermined-consensus-result).
+For this obligation the honest answer is `CONSUMES`.
+
+**4. Deterministic code takes over from here — no LLM output below this
+line.** With `verdict=CONSUMES`, the contract sums every other
+`ADMITTED`+`CONSUMES` commitment on this pool whose time window
+overlaps this one (`_reserved_units_overlapping`), adds this request's
+2 units, and compares the total against `total_units=4`. Nothing is
+reserved yet, so `0 + 2 <= 4` — it fits. The commitment moves to
+`ADMITTED`, `reserved_units` becomes 2, and the escrowed bond is
+refunded to the submitter in full (no capacity risk was ever realized,
+so there is nothing to keep).
+
+**5. A second, larger claim on the same resource is correctly refused.**
+Suppose Acme separately submits a second commitment on the same pool
+for 3 more exclusively-reserved units, with an overlapping window. Step
+3 again classifies it as `CONSUMES` (it's phrased just as explicitly).
+Step 4 now sums `2` (already reserved) `+ 3` (requested) `= 5`, compares
+against `total_units=4`, and **this is the moment the whole contract
+exists for**: `5 > 4`, so the commitment is deterministically set to
+`REJECTED_OVERCOMMIT` and the bond is refunded — no LLM was ever asked
+whether this was "acceptable," because that question is never put to
+anyone. This exact sequence has been run against the live deployment;
+see the `test_overcommit_is_deterministically_rejected_live` test in
+[`docs/TESTING.md`](docs/TESTING.md).
+
+**6. Optional supporting evidence, at any point before a verdict
+settles.** A caller can attach a real fetched web page
+(`submit_external_verification`) or a real photograph
+(`submit_visual_capacity_evidence`) as corroborating context — both run
+under GenLayer consensus, both are read-only with respect to capacity
+and escrow (see [Design boundary](#design-boundary-whats-deterministic-vs-what-needs-consensus)),
+and neither can change what step 4 concludes.
 
 ## Design boundary: what's deterministic vs. what needs consensus
 
@@ -275,6 +433,57 @@ deployed contract instance can model:
 Anything that can be reduced to *(a fixed numeric capacity) + (natural
 language obligations that may or may not draw on it)* fits without
 modifying the contract.
+
+## Design decisions and trade-offs
+
+A few choices were made deliberately, and are worth calling out
+explicitly for reviewers rather than leaving them implicit in the code:
+
+- **No per-pool reverse index.** An earlier version kept a
+  `TreeMap[str, PoolIndex]` mapping each pool to its own commitment-ID
+  list, for O(k) lookups instead of an O(n) scan over every commitment
+  ever submitted. That pattern hit a GenVM storage-generic
+  instantiation limitation on the pinned runner and made `register_pool`
+  revert on every call once deployed (full root cause and fix in
+  [`docs/TESTING.md`](docs/TESTING.md#a-bug-this-suite-caught-before-it-shipped)).
+  The fix — filtering the single global `commitment_order` list by
+  `pool_id` — trades lookup complexity for simplicity and correctness.
+  At the scale a single capacity pool realistically operates at (tens
+  to low thousands of commitments), this is the right trade.
+- **Time is a contract-local logical clock, not wall-clock time.**
+  `epoch_counter` increments once per qualifying write call. This means
+  a "5-second window" isn't expressible directly — callers reason in
+  ticks, not seconds. The alternative (reading real time) would let
+  validators observe different values depending on when their node
+  processed the transaction, which is exactly the kind of
+  nondeterminism this contract is built to avoid everywhere else. See
+  [Why this shouldn't produce an UNDETERMINED consensus result](#why-this-shouldnt-produce-an-undetermined-consensus-result).
+- **The classifier is asked the narrowest possible question.** It would
+  have been simpler to ask the model "should this be admitted?" and
+  trust the answer. Instead it's asked two closed sub-questions
+  (category match, consumption verdict) and the actual admission
+  decision is made entirely by deterministic code afterward. This is
+  more verbose but means the LLM's blast radius, if it misbehaves or is
+  manipulated, is bounded to "this obligation gets miscategorized,"
+  never "this contract accepts an overcommitment" or "this contract
+  pays out incorrectly."
+- **Visual and web evidence are annotation-only by construction, not
+  by convention.** `submit_visual_capacity_evidence` and
+  `submit_external_verification` don't merely avoid writing to
+  `total_units`/`reserved_units`/escrow fields as a matter of
+  discipline — those fields are simply never referenced anywhere in
+  either function's code path, so there is no assignment to
+  accidentally leave in or remove. A reviewer can confirm this by
+  reading the two functions in isolation, without needing to reason
+  about the rest of the contract.
+- **Bad-faith forfeiture requires an owner ruling, not automatic
+  slashing.** An `AMBIGUOUS` verdict never auto-forfeits a bond — it
+  escalates to `PENDING_ARBITRATION`, and only an explicit
+  `resolve_ambiguous(..., "REJECT_BAD_FAITH")` call from the pool owner
+  can forfeit it. This means a genuinely ambiguous (not malicious)
+  submission is never punished by default, and a silent owner can never
+  trap a submitter's bond forever — `claim_arbitration_timeout` is the
+  submitter's unconditional recovery path.
 
 ## Reading order for reviewers
 
