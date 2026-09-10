@@ -7,7 +7,7 @@ import json
 import pytest
 from gltest.contracts import get_contract_factory
 
-CONTRACT_ADDRESS = "0x3034F21a81ce366a6ae1489744Aa89897c9D6E21"
+CONTRACT_ADDRESS = "0x3104Cb8AD2A8428714614D9C55707A17D1C6b90B"
 
 
 @pytest.mark.integration

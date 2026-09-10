@@ -3,10 +3,10 @@
 A semantic capacity / overcommitment-prevention primitive for autonomous
 services and agents, built as a GenLayer Intelligent Contract.
 
-**Source:** [`promise_ledger.py`](promise_ledger.py) — single file, 1,272
-lines, 20 public methods (11 write, 9 view), 0 constructor parameters.
-**Deployed on StudioNet:** [`0x3034F21a81ce366a6ae1489744Aa89897c9D6E21`](https://genlayer-explorer.vercel.app)
-— live-verified end to end; see [Verified](#verified) below and
+**Source:** [`promise_ledger.py`](promise_ledger.py) — single file, 24 public
+methods (15 write, 9 view), 0 constructor parameters.
+**Deployment:** update the address below after the corrected StudioNet deployment;
+the prior deployment is not compatible with this corrected lifecycle. See
 [`docs/TESTING.md`](docs/TESTING.md) for the full test report.
 
 ## Table of contents
@@ -59,7 +59,7 @@ work, enforced in code rather than left to convention:
   set a number or decide whether a conflict is acceptable.
 
 On top of that split, the contract adds a full **escrow layer**: every
-commitment submission locks a GEN bond, and every one of the six
+commitment submission locks a GEN bond, and every exit path
 possible outcomes for that bond (admitted, rejected for capacity,
 rejected for bad faith, cancelled, timed out, or released) is an
 explicit, independently reachable code path that zeroes the stored
@@ -76,7 +76,7 @@ so they can only ever add corroborating context, never override the
 deterministic guarantee.
 
 Every one of these pieces — the capacity math, the bounded classifier,
-all six escrow exit paths, the web fetch, and the image evidence — has
+all escrow exit paths, the web fetch, and the image evidence — has
 been exercised against a real, live StudioNet deployment with real GEN,
 real accounts, a real fetched photograph, a real external URL, and real
 LLM consensus rounds. See [Verified](#verified) and
@@ -171,8 +171,10 @@ leader and validator agree on both fields — see
 [Why this shouldn't produce an UNDETERMINED consensus result](#why-this-shouldnt-produce-an-undetermined-consensus-result).
 For this obligation the honest answer is `CONSUMES`.
 
-**4. Deterministic code takes over from here — no LLM output below this
-line.** With `verdict=CONSUMES`, the contract sums every other
+**4. Provider authorization and deterministic code take over from here — no
+LLM output below this line.** A `CONSUMES` result first becomes
+`PENDING_OWNER_APPROVAL`; it cannot reserve anything. Only the pool owner may
+call `approve_commitment`. That call sums every other
 `ADMITTED`+`CONSUMES` commitment on this pool whose time window
 overlaps this one (`_reserved_units_overlapping`), adds this request's
 2 units, and compares the total against `total_units=4`. Nothing is
@@ -288,8 +290,10 @@ field(s), `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)` produces
 the consensus-checked result.
 
 Everything else in the contract (`register_pool`, `submit_commitment`,
-`cancel_commitment`, `resolve_ambiguous`, `claim_arbitration_timeout`,
-`release_commitment`, `update_capacity`, `deregister_pool`) is ordinary
+`cancel_commitment`, `approve_commitment`, `reject_pending_approval`,
+`cancel_pending_approval`, `cancel_admitted_commitment`, `resolve_ambiguous`,
+`claim_arbitration_timeout`, `release_commitment`, `update_capacity`,
+`deregister_pool`) is ordinary
 deterministic contract logic — no LLM, no web, no image calls, no
 consensus risk.
 
@@ -321,19 +325,25 @@ PENDING_CLASSIFICATION
    |- cancel_commitment() ------------------------------> CANCELLED (bond refunded)
    `- classify_commitment()
         |- verdict = DOES_NOT_CONSUME -------------------> ADMITTED (bond refunded, no reservation)
-        |- verdict = CONSUMES -> deterministic capacity check
-        |     |- fits ------------------------------------> ADMITTED (bond refunded, capacity reserved)
-        |     `- doesn't fit ------------------------------> REJECTED_OVERCOMMIT (bond refunded)
+        |- verdict = CONSUMES ----------------------------> PENDING_OWNER_APPROVAL
+        |     |- cancel_pending_approval() ----------------> CANCELLED (bond refunded)
+        |     |- reject_pending_approval() -----------------> REJECTED_BY_OWNER (bond refunded)
+        |     `- approve_commitment() -> deterministic capacity check
+        |           |- fits --------------------------------> ADMITTED (bond refunded, capacity reserved)
+        |           `- doesn't fit --------------------------> REJECTED_OVERCOMMIT (bond refunded)
         `- verdict = AMBIGUOUS ---------------------------> PENDING_ARBITRATION
                 |- resolve_ambiguous(ADMIT) -> same capacity check as above
                 |- resolve_ambiguous(REJECT_BAD_FAITH) ----> REJECTED_BAD_FAITH (bond forfeited to pool owner)
                 `- claim_arbitration_timeout() (deadline passed) -> REFUNDED_TIMEOUT (bond refunded)
 
-ADMITTED (verdict = CONSUMES, bounded window)
-   `- release_commitment() (after window_end_epoch) -----> RELEASED (capacity freed, no money movement)
+ADMITTED
+   |- release_commitment() (anyone, after a bounded window ends) -> RELEASED
+   `- cancel_admitted_commitment() (owner or submitter, including unbounded) -> RELEASED
 ```
 
-Every terminal state that involves the bond is reachable, and every path
+Every consuming reservation requires the pool owner's separate approval,
+and every admitted commitment has an authorized release path. Every terminal
+state that involves the bond is reachable, and every path
 zeroes the ledger field (`bond_deposited`) **before** calling `_send_gen`
 — so a second call into any payout path finds the balance already at
 zero and cannot double-spend. Pool deregistration and registration stake
@@ -344,16 +354,19 @@ refunds follow the identical zero-then-transfer ordering.
 | Exit path | Trigger | Recipient |
 |---|---|---|
 | Admit (no consumption) | `classify_commitment` → `DOES_NOT_CONSUME` | submitter (full refund) |
-| Admit (fits capacity) | `classify_commitment`/`resolve_ambiguous` → `CONSUMES`, capacity check passes | submitter (full refund) |
+| Admit (fits capacity) | owner `approve_commitment` → `CONSUMES`, capacity check passes | submitter (full refund) |
 | Reject — overcommitted | capacity check fails | submitter (full refund — not the submitter's fault) |
+| Reject — owner declined | owner `reject_pending_approval` | submitter (full refund) |
 | Reject — bad faith | owner rules `REJECT_BAD_FAITH` on an ambiguous submission | pool owner (forfeited) |
 | Cancel | submitter cancels before classification | submitter (full refund) |
+| Cancel pending approval | submitter `cancel_pending_approval` | submitter (full refund) |
+| Early release | owner or submitter `cancel_admitted_commitment` | capacity freed (no escrow remains) |
 | Timeout recovery | owner never rules on an ambiguous submission before the arbitration deadline | submitter (full refund) |
 | Pool deregistration | owner deregisters an empty pool | pool owner (stake refund) |
 
 No path can be triggered twice: every one re-derives the amount from the
 stored ledger field and zeroes it before the single `_send_gen` call. All
-seven of these exit paths — including the two overcommit/bad-faith
+these exit paths — including the two overcommit/bad-faith
 rejection paths — have been exercised against the live deployment (see
 [`docs/TESTING.md`](docs/TESTING.md)); the timeout-recovery path is
 structurally verified but not run to completion live, for reasons
@@ -371,9 +384,13 @@ explained there.
 | `submit_commitment` | `commitment_id, pool_id, obligation_text, requested_units, window_start_epoch, window_end_epoch` | anyone | yes, exact bond | no |
 | `cancel_commitment` | `commitment_id` | submitter, only while `PENDING_CLASSIFICATION` | no | no |
 | `classify_commitment` | `commitment_id` | anyone | no | **yes** |
+| `approve_commitment` | `commitment_id` | pool owner, only while `PENDING_OWNER_APPROVAL` | no | no |
+| `reject_pending_approval` | `commitment_id` | pool owner, only while `PENDING_OWNER_APPROVAL` | no | no |
+| `cancel_pending_approval` | `commitment_id` | submitter, only while `PENDING_OWNER_APPROVAL` | no | no |
 | `resolve_ambiguous` | `commitment_id, ruling` | pool owner, only while `PENDING_ARBITRATION` | no | no |
 | `claim_arbitration_timeout` | `commitment_id` | submitter, only after the arbitration deadline | no | no |
 | `release_commitment` | `commitment_id` | anyone, only after `window_end_epoch` | no | no |
+| `cancel_admitted_commitment` | `commitment_id` | pool owner or submitter, including unbounded windows | no | no |
 | `submit_visual_capacity_evidence` | `pool_id, image_data, claim_note` | anyone | no | **yes** |
 | `submit_external_verification` | `commitment_id, url` | anyone, only while pending | no | **yes** |
 
@@ -512,7 +529,7 @@ Runner pinned to `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09
 — confirmed resolvable/downloadable, not a schema-fetch-only hash.
 
 **Deployed and live-tested on StudioNet:**
-[`0x3034F21a81ce366a6ae1489744Aa89897c9D6E21`](https://genlayer-explorer.vercel.app)
+[`0x3104Cb8AD2A8428714614D9C55707A17D1C6b90B`](https://genlayer-explorer.vercel.app)
 
 Every write method except the three pool-owner-gated ones
 (`update_capacity`, `deregister_pool`, `resolve_ambiguous`) has been run

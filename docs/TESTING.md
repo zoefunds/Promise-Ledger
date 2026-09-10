@@ -71,9 +71,9 @@ build on prior state within the run:
 2. **`test_register_pool_and_admit_consumes_commitment_live`** —
    `register_pool` (skipped if the pool already exists from a prior run
    against the same address) → `submit_commitment` → `classify_commitment`,
-   asserting the result lands on `CONSUMES` + `ADMITTED` (the obligation
-   text is written to be unambiguous, so this is hard-asserted, not just
-   printed).
+   asserting the result lands on `CONSUMES` + `PENDING_OWNER_APPROVAL`, then
+   having the provider call `approve_commitment` before asserting `ADMITTED`.
+   The text is written to be unambiguous, so this is hard-asserted.
 3. **`test_external_verification_and_does_not_consume_commitment_live`**
    — `submit_commitment` → `submit_external_verification` (a real fetch
    of a Wikipedia page) → `classify_commitment`. The external-evidence
@@ -104,14 +104,13 @@ build on prior state within the run:
 
 ### Latest confirmed run
 
-All 7 tests passing together in a single `pytest` invocation against
-`0x3034F21a81ce366a6ae1489744Aa89897c9D6E21` (~10 minutes wall-clock,
-StudioNet). Re-running the suite against the same address is safe and
-idempotent: `register_pool` detects and reuses an existing pool, and
-later tests adapt to however much capacity is left rather than assuming
-a clean slate (see `test_visual_evidence_and_bounded_release_live`'s
-capacity check above) — running it repeatedly does not corrupt state or
-require a fresh deployment.
+The prior contract's 7-test result applied only to the previous lifecycle at
+`0x3034F21a81ce366a6ae1489744Aa89897c9D6E21`; do not use that address to
+verify this fix. The corrected deployment is
+[`0x3104Cb8AD2A8428714614D9C55707A17D1C6b90B`](https://genlayer-explorer.vercel.app).
+The integration files target that address. The suite asserts that a consuming
+classification pauses for owner approval and that a non-owner approval attempt
+fails without changing reserved capacity.
 
 ## Why two things are documented rather than forced
 
@@ -179,10 +178,13 @@ matching on `pool_id`. This needs no nested generic storage type, is
 simpler to audit, and is more than sufficient at the scale a single
 capacity pool operates at.
 
-The fixed contract was redeployed to StudioNet at
-**`0x3034F21a81ce366a6ae1489744Aa89897c9D6E21`**, which every test in
-this suite runs against, and which both `genvm-lint check` and the full
-live integration suite verify clean end to end.
+The previous deployment above remains historical only. The corrected contract
+is deployed on StudioNet at
+**`0x3104Cb8AD2A8428714614D9C55707A17D1C6b90B`**. Its schema was retrieved
+successfully and its non-owner lifecycle was exercised through pool
+registration, consuming submission, and consensus classification. See
+[`review.md`](../review.md) for the exact on-chain observations and the
+remaining owner-gated coverage boundary.
 
 ## Re-deploying to a fresh address
 

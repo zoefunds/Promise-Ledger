@@ -78,9 +78,11 @@ POOL_STATUS_DEREGISTERED = "DEREGISTERED"
 
 COMMIT_STATUS_PENDING_CLASSIFICATION = "PENDING_CLASSIFICATION"
 COMMIT_STATUS_PENDING_ARBITRATION = "PENDING_ARBITRATION"
+COMMIT_STATUS_PENDING_OWNER_APPROVAL = "PENDING_OWNER_APPROVAL"
 COMMIT_STATUS_ADMITTED = "ADMITTED"
 COMMIT_STATUS_REJECTED_OVERCOMMIT = "REJECTED_OVERCOMMIT"
 COMMIT_STATUS_REJECTED_BAD_FAITH = "REJECTED_BAD_FAITH"
+COMMIT_STATUS_REJECTED_BY_OWNER = "REJECTED_BY_OWNER"
 COMMIT_STATUS_REFUNDED_TIMEOUT = "REFUNDED_TIMEOUT"
 COMMIT_STATUS_CANCELLED = "CANCELLED"
 COMMIT_STATUS_RELEASED = "RELEASED"
@@ -204,6 +206,7 @@ class PromiseLedger(gl.Contract):
         self.stats["total_admitted"] = u256(0)
         self.stats["total_rejected_overcommit"] = u256(0)
         self.stats["total_rejected_bad_faith"] = u256(0)
+        self.stats["total_rejected_by_owner"] = u256(0)
         self.stats["total_cancelled"] = u256(0)
         self.stats["total_timeout_refunds"] = u256(0)
         self.stats["total_ambiguous"] = u256(0)
@@ -649,6 +652,28 @@ class PromiseLedger(gl.Contract):
             self._bump_stat("total_bond_wei_refunded", refund)
             self._send_gen(c.submitter, refund)
 
+    @gl.public.write
+    def cancel_pending_approval(self, commitment_id: str) -> None:
+        """Submitter escape hatch for a consuming request that is waiting
+        for provider approval. This prevents a silent owner from trapping
+        the submitter's bond in the approval queue."""
+        c = self._get_commitment_or_raise(commitment_id)
+        self._require_sender(c.submitter, "cancel this pending approval")
+        if c.status != COMMIT_STATUS_PENDING_OWNER_APPROVAL:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only PENDING_OWNER_APPROVAL commitments can "
+                f"be cancelled (status={c.status})"
+            )
+
+        refund = c.bond_deposited
+        c.status = COMMIT_STATUS_CANCELLED
+        c.bond_deposited = u256(0)
+        self.commitments[commitment_id] = c
+        self._bump_stat("total_cancelled", u256(1))
+        if refund > u256(0):
+            self._bump_stat("total_bond_wei_refunded", refund)
+            self._send_gen(c.submitter, refund)
+
     # ------------------------------------------------------------------
     # SEMANTIC CLASSIFICATION -- the only place an LLM touches this contract's
     # decision path, and only over a bounded 3-way question.
@@ -790,8 +815,55 @@ class PromiseLedger(gl.Contract):
                 self._send_gen(c.submitter, refund)
             return COMMIT_STATUS_ADMITTED
 
-        # verdict == CONSUMES: run the deterministic overcommitment check.
+        # A consuming request cannot reserve a provider's pool merely
+        # because an arbitrary caller submitted text that classifies as
+        # consuming. The owner must explicitly authorize it next.
+        c.status = COMMIT_STATUS_PENDING_OWNER_APPROVAL
+        self.commitments[commitment_id] = c
+        return COMMIT_STATUS_PENDING_OWNER_APPROVAL
+
+    @gl.public.write
+    def approve_commitment(self, commitment_id: str) -> str:
+        """Owner-only admission authorization for a consuming commitment.
+        Capacity arithmetic is intentionally performed only after this
+        authorization, so third parties cannot lock a provider's capacity
+        or registration stake by submitting/classifying a request."""
+        c = self._get_commitment_or_raise(commitment_id)
+        pool = self._get_pool_or_raise(c.pool_id)
+        self._require_sender(pool.owner, "approve commitments for this pool")
+        self._require_pool_active(pool)
+        if c.status != COMMIT_STATUS_PENDING_OWNER_APPROVAL:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Commitment is not PENDING_OWNER_APPROVAL "
+                f"(status={c.status})"
+            )
+        if c.verdict != VERDICT_CONSUMES:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only CONSUMES commitments require approval"
+            )
         return self._settle_consumes_verdict(commitment_id, c, pool)
+
+    @gl.public.write
+    def reject_pending_approval(self, commitment_id: str) -> None:
+        """Owner-only refusal with a full bond refund. This gives every
+        owner-approval request a definitive, non-custodial exit."""
+        c = self._get_commitment_or_raise(commitment_id)
+        pool = self._get_pool_or_raise(c.pool_id)
+        self._require_sender(pool.owner, "reject commitments for this pool")
+        if c.status != COMMIT_STATUS_PENDING_OWNER_APPROVAL:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Commitment is not PENDING_OWNER_APPROVAL "
+                f"(status={c.status})"
+            )
+
+        refund = c.bond_deposited
+        c.status = COMMIT_STATUS_REJECTED_BY_OWNER
+        c.bond_deposited = u256(0)
+        self.commitments[commitment_id] = c
+        self._bump_stat("total_rejected_by_owner", u256(1))
+        if refund > u256(0):
+            self._bump_stat("total_bond_wei_refunded", refund)
+            self._send_gen(c.submitter, refund)
 
     def _settle_consumes_verdict(
         self, commitment_id: str, c: Commitment, pool: CapacityPool
@@ -950,6 +1022,38 @@ class PromiseLedger(gl.Contract):
                 pool.reserved_units = u256(0)
             if pool.active_commitment_count > u256(0):
                 pool.active_commitment_count = pool.active_commitment_count - u256(1)
+            self.pools[c.pool_id] = pool
+
+        c.status = COMMIT_STATUS_RELEASED
+        self.commitments[commitment_id] = c
+
+    @gl.public.write
+    def cancel_admitted_commitment(self, commitment_id: str) -> None:
+        """Authorized early release for an admitted commitment. Either the
+        provider or the submitter may terminate it; this is the mandatory
+        escape hatch for unbounded windows and also safely handles bounded
+        reservations before their end epoch."""
+        c = self._get_commitment_or_raise(commitment_id)
+        pool = self._get_pool_or_raise(c.pool_id)
+        sender = gl.message.sender_address
+        if sender != c.submitter and sender != pool.owner:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only the submitter or pool owner may cancel "
+                f"an admitted commitment"
+            )
+        if c.status != COMMIT_STATUS_ADMITTED:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only ADMITTED commitments can be cancelled "
+                f"(status={c.status})"
+            )
+
+        if c.verdict == VERDICT_CONSUMES:
+            if pool.reserved_units < c.requested_units or pool.active_commitment_count <= u256(0):
+                raise gl.vm.UserError(
+                    f"{ERROR_EXPECTED} Inconsistent pool reservation accounting"
+                )
+            pool.reserved_units = pool.reserved_units - c.requested_units
+            pool.active_commitment_count = pool.active_commitment_count - u256(1)
             self.pools[c.pool_id] = pool
 
         c.status = COMMIT_STATUS_RELEASED
@@ -1241,6 +1345,7 @@ class PromiseLedger(gl.Contract):
             "total_admitted",
             "total_rejected_overcommit",
             "total_rejected_bad_faith",
+            "total_rejected_by_owner",
             "total_cancelled",
             "total_timeout_refunds",
             "total_ambiguous",

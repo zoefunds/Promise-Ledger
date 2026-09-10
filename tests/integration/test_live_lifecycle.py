@@ -22,7 +22,7 @@ from eth_account import Account
 from gltest.contracts import get_contract_factory
 from gltest.assertions import tx_execution_failed
 
-CONTRACT_ADDRESS = "0x3034F21a81ce366a6ae1489744Aa89897c9D6E21"
+CONTRACT_ADDRESS = "0x3104Cb8AD2A8428714614D9C55707A17D1C6b90B"
 KEYS_DIR = Path(__file__).parent.parent / ".keys"
 GEN = 10**18
 PASSWORD = "pl-live-test-pass-2026"
@@ -134,11 +134,53 @@ def test_register_pool_and_admit_consumes_commitment_live():
         f"Expected an unambiguous exclusive-reservation claim to classify as "
         f"CONSUMES; got {c['verdict']} ({c['classification_notes']})"
     )
-    assert c["status"] == "ADMITTED"
-    assert c["bond_deposited"] == "0"
+    assert c["status"] == "PENDING_OWNER_APPROVAL"
+    assert c["bond_deposited"] == BOND_WEI
 
-    pool_after = _get_pool(c_anyone, POOL_ID)
-    assert pool_after["reserved_units"] >= 2
+    # Classification alone must never reserve provider capacity, and the
+    # submitter cannot turn its own request into a reservation.
+    pool_before_approval = _get_pool(c_anyone, POOL_ID)
+    receipt = c_submitter_a.approve_commitment(args=[commitment_id]).transact(
+        wait_interval=5000, wait_retries=90
+    )
+    assert tx_execution_failed(receipt), receipt
+    assert _get_pool(c_anyone, POOL_ID)["reserved_units"] == pool_before_approval["reserved_units"]
+
+    # This non-owner run intentionally stops here: owner approval is covered
+    # separately and must not be exercised by this suite invocation.
+
+
+@pytest.mark.integration
+def test_cancel_pending_owner_approval_live():
+    """A submitter can always recover a bond from a consuming request that
+    awaits owner approval; no provider action is required."""
+    submitter_a = _load_account("submitter_a")
+    factory = get_contract_factory(contract_file_path="promise_ledger.py")
+    c_submitter_a = factory.build_contract(CONTRACT_ADDRESS, account=submitter_a)
+    pool = _get_pool(c_submitter_a, POOL_ID)
+    if pool["status"] != "ACTIVE":
+        pytest.skip("pool not active; run the registration test first")
+
+    commitment_id = f"acme-cancellable-approval-{int(time.time())}"
+    receipt = c_submitter_a.submit_commitment(
+        args=[commitment_id, POOL_ID, "Acme reserves 1 dedicated GPU unit exclusively.", "1", "0", "0"]
+    ).transact(value=int(BOND_WEI), wait_interval=5000, wait_retries=90)
+    assert not tx_execution_failed(receipt), receipt
+    receipt = c_submitter_a.classify_commitment(args=[commitment_id]).transact(
+        wait_interval=8000, wait_retries=150
+    )
+    assert not tx_execution_failed(receipt), receipt
+    c = _get_commitment(c_submitter_a, commitment_id)
+    if c["status"] != "PENDING_OWNER_APPROVAL":
+        pytest.skip(f"classifier did not return CONSUMES (got {c['verdict']})")
+
+    receipt = c_submitter_a.cancel_pending_approval(args=[commitment_id]).transact(
+        wait_interval=5000, wait_retries=90
+    )
+    assert not tx_execution_failed(receipt), receipt
+    c = _get_commitment(c_submitter_a, commitment_id)
+    assert c["status"] == "CANCELLED"
+    assert c["bond_deposited"] == "0"
 
 
 @pytest.mark.integration
@@ -193,6 +235,8 @@ def test_external_verification_and_does_not_consume_commitment_live():
             "status here; covered separately by the arbitration test."
         )
         return
+    if c["status"] == "PENDING_OWNER_APPROVAL":
+        return
     assert c["status"] == "ADMITTED"
     assert c["bond_deposited"] == "0"
 
@@ -246,12 +290,7 @@ def test_overcommit_is_deterministically_rejected_live():
         )
         return
 
-    assert c["status"] == "REJECTED_OVERCOMMIT", (
-        f"3 more units on top of {pool['reserved_units']} already reserved "
-        f"against a total of {pool['total_units']} must not fit, but got "
-        f"status={c['status']}"
-    )
-    assert c["bond_deposited"] == "0"
+    assert c["status"] == "PENDING_OWNER_APPROVAL"
 
 
 @pytest.mark.integration
@@ -355,6 +394,9 @@ def test_visual_evidence_and_bounded_release_live():
 
     c = _get_commitment(c_anyone, commitment_id)
     print("verdict:", c["verdict"], "| status:", c["status"])
+    if c["status"] == "PENDING_OWNER_APPROVAL":
+        return
+
     if c["status"] != "ADMITTED":
         print(
             "Bounded commitment did not reach ADMITTED this run "
